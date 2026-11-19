@@ -49,6 +49,14 @@ pub struct Checkpoint {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct TimeWeightCheckpoint {
+    pub ledger: u32,
+    pub enabled: bool,
+    pub scale: u32,
+}
+
+#[contracttype]
 #[derive(Clone, Default)]
 pub struct DelegatorRecord {
     pub balance: i128,
@@ -69,6 +77,7 @@ pub enum DataKey {
     DelegatorRecord(Address),        // delegator -> DelegatorRecord
     TimeWeightEnabled,               // bool
     TimeWeightScale,                 // u32
+    TimeWeightCheckpoints,           // Vec<TimeWeightCheckpoint>
     DomainSeparator,                 // BytesN<32>: cached at init
     UsedNonce(Address, u64),         // (delegator, nonce) -> bool: replay protection
     DelegationPermitExpiry(Address), // delegator -> u32: latest permit expiry
@@ -98,6 +107,10 @@ impl TokenVotesContract {
     /// Initialize with the underlying SEP-41 token.
     pub fn initialize(env: Env, admin: Address, token: Address) {
         admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            env.panic_with_error(TokenVotesError::AlreadyInitialized);
+        }
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         // Set default retention period to 100,800 ledgers (~2 weeks at 7.5s per ledger)
@@ -112,6 +125,15 @@ impl TokenVotesContract {
         env.storage()
             .instance()
             .set(&DataKey::TimeWeightScale, &4204800u32);
+        let mut time_weight_checkpoints = soroban_sdk::Vec::new(&env);
+        time_weight_checkpoints.push_back(TimeWeightCheckpoint {
+            ledger: env.ledger().sequence(),
+            enabled: false,
+            scale: 4204800,
+        });
+        env.storage()
+            .instance()
+            .set(&DataKey::TimeWeightCheckpoints, &time_weight_checkpoints);
         // Relayer whitelist is opt-in.
         env.storage()
             .instance()
@@ -422,11 +444,11 @@ impl TokenVotesContract {
         }
         let last = checkpoints.last().unwrap();
 
-        if !Self::time_weight_enabled(env.clone()) {
+        let (enabled, scale) = Self::current_time_weight_settings(&env);
+        if !enabled {
             return last.votes;
         }
 
-        let scale = Self::time_weight_scale(env.clone());
         let current_ledger = env.ledger().sequence();
         let bonus = (current_ledger as i128 * last.votes - last.weighted_sum) / scale as i128;
         last.votes + bonus
@@ -606,11 +628,11 @@ impl TokenVotesContract {
             return 0;
         }
 
-        if !Self::time_weight_enabled(env.clone()) {
+        let (enabled, scale) = Self::time_weight_settings_at(&env, ledger);
+        if !enabled {
             return cp.votes;
         }
 
-        let scale = Self::time_weight_scale(env.clone());
         let bonus = (ledger as i128 * cp.votes - cp.weighted_sum) / scale as i128;
         cp.votes + bonus
     }
@@ -647,59 +669,13 @@ impl TokenVotesContract {
             return 0;
         }
 
-        if !Self::time_weight_enabled(env.clone()) {
+        let (enabled, scale) = Self::time_weight_settings_at(&env, ledger);
+        if !enabled {
             return cp.votes;
         }
 
-        let scale = Self::time_weight_scale(env.clone());
         let bonus = (ledger as i128 * cp.votes - cp.weighted_sum) / scale as i128;
         cp.votes + bonus
-    }
-
-    /// Write a checkpoint for an account. Called internally after balance changes.
-    pub fn checkpoint(env: Env, account: Address, votes: i128) {
-        let key = DataKey::Checkpoints(account.clone());
-        let mut checkpoints: soroban_sdk::Vec<Checkpoint> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(soroban_sdk::Vec::new(&env));
-        extend_persistent_ttl(&env, &key);
-
-        let current_ledger = env.ledger().sequence();
-
-        // When using raw checkpoint manually, we assume no weighted sum change for simplicity
-        // or we try to estimate it based on last checkpoint.
-        let weighted_sum = if checkpoints.is_empty() {
-            votes * current_ledger as i128
-        } else {
-            let last = checkpoints.last().unwrap();
-            let delta = votes - last.votes;
-            last.weighted_sum + delta * current_ledger as i128
-        };
-
-        if !checkpoints.is_empty() && checkpoints.last().unwrap().ledger == current_ledger {
-            let last_idx = checkpoints.len() - 1;
-            checkpoints.set(
-                last_idx,
-                Checkpoint {
-                    ledger: current_ledger,
-                    votes,
-                    weighted_sum,
-                },
-            );
-        } else {
-            checkpoints.push_back(Checkpoint {
-                ledger: current_ledger,
-                votes,
-                weighted_sum,
-            });
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Checkpoints(account), &checkpoints);
-        extend_persistent_ttl(&env, &key);
     }
 
     // --- Internal helpers ---
@@ -1052,6 +1028,7 @@ impl TokenVotesContract {
         env.storage()
             .instance()
             .set(&DataKey::TimeWeightEnabled, &enabled);
+        Self::record_time_weight_settings(&env, enabled, Self::time_weight_scale(env.clone()));
     }
 
     /// Get whether time-weighted voting is enabled.
@@ -1064,6 +1041,10 @@ impl TokenVotesContract {
 
     /// Set the time-weighted reward scale (admin only).
     pub fn set_time_weight_scale(env: Env, scale_ledgers: u32) {
+        if scale_ledgers == 0 {
+            env.panic_with_error(TokenVotesError::InvalidTimeWeightScale);
+        }
+
         let admin: Address = env
             .storage()
             .instance()
@@ -1074,6 +1055,11 @@ impl TokenVotesContract {
         env.storage()
             .instance()
             .set(&DataKey::TimeWeightScale, &scale_ledgers);
+        Self::record_time_weight_settings(
+            &env,
+            Self::time_weight_enabled(env.clone()),
+            scale_ledgers,
+        );
     }
 
     /// Get the current time-weighted reward scale.
@@ -1082,6 +1068,66 @@ impl TokenVotesContract {
             .instance()
             .get(&DataKey::TimeWeightScale)
             .unwrap_or(4204800u32)
+    }
+
+    fn current_time_weight_settings(env: &Env) -> (bool, u32) {
+        (
+            Self::time_weight_enabled(env.clone()),
+            Self::time_weight_scale(env.clone()),
+        )
+    }
+
+    fn record_time_weight_settings(env: &Env, enabled: bool, scale: u32) {
+        let mut checkpoints: soroban_sdk::Vec<TimeWeightCheckpoint> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TimeWeightCheckpoints)
+            .unwrap_or(soroban_sdk::Vec::new(env));
+        let current_ledger = env.ledger().sequence();
+        let checkpoint = TimeWeightCheckpoint {
+            ledger: current_ledger,
+            enabled,
+            scale,
+        };
+
+        if !checkpoints.is_empty() && checkpoints.last().unwrap().ledger == current_ledger {
+            let last_idx = checkpoints.len() - 1;
+            checkpoints.set(last_idx, checkpoint);
+        } else {
+            checkpoints.push_back(checkpoint);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TimeWeightCheckpoints, &checkpoints);
+    }
+
+    fn time_weight_settings_at(env: &Env, ledger: u32) -> (bool, u32) {
+        let checkpoints: soroban_sdk::Vec<TimeWeightCheckpoint> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TimeWeightCheckpoints)
+            .unwrap_or(soroban_sdk::Vec::new(env));
+        if checkpoints.is_empty() {
+            return (false, 4204800);
+        }
+
+        let mut low = 0u32;
+        let mut high = checkpoints.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if checkpoints.get(mid).unwrap().ledger <= ledger {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        if low == 0 {
+            return (false, 4204800);
+        }
+        let checkpoint = checkpoints.get(low - 1).unwrap();
+        (checkpoint.enabled, checkpoint.scale)
     }
 
     /// Prune total supply checkpoints older than cutoff_ledger.
@@ -1222,6 +1268,55 @@ mod tests {
         let client = TokenVotesContractClient::new(env, &contract_id);
         client.initialize(admin, &token_addr);
         (contract_id, token_addr)
+    }
+
+    #[test]
+    fn test_initialize_already_initialized_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let (contract_id, token_addr) = setup(&env, &admin);
+        let client = TokenVotesContractClient::new(&env, &contract_id);
+
+        let err = client
+            .try_initialize(&admin, &token_addr)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, TokenVotesError::AlreadyInitialized.into());
+    }
+
+    #[test]
+    fn test_zero_time_weight_scale_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let (contract_id, _) = setup(&env, &admin);
+        let client = TokenVotesContractClient::new(&env, &contract_id);
+
+        let err = client.try_set_time_weight_scale(&0).unwrap_err().unwrap();
+        assert_eq!(err, TokenVotesError::InvalidTimeWeightScale.into());
+    }
+
+    #[test]
+    fn test_historical_votes_use_snapshot_time_weight_settings() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let delegator = Address::generate(&env);
+        let (contract_id, token_addr) = setup(&env, &admin);
+        let client = TokenVotesContractClient::new(&env, &contract_id);
+        token::StellarAssetClient::new(&env, &token_addr).mint(&delegator, &1000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 5);
+        client.set_time_weight_enabled(&true);
+        env.ledger().with_mut(|l| l.sequence_number = 10);
+        client.delegate(&delegator, &delegator);
+        env.ledger().with_mut(|l| l.sequence_number = 15);
+        let snapshot_votes = client.get_past_votes(&delegator, &15);
+
+        env.ledger().with_mut(|l| l.sequence_number = 20);
+        client.set_time_weight_scale(&1);
+        assert_eq!(client.get_past_votes(&delegator, &15), snapshot_votes);
     }
 
     #[test]
@@ -1521,9 +1616,8 @@ mod tests {
             l.sequence_number = 10;
         });
         sac_client.mint(&user1, &500i128);
-        // We must call checkpoint or delegate to update the voting power log.
-        // In a real scenario, the token contract would call this.
-        client.checkpoint(&user1, &1500i128);
+        // Re-delegation refreshes the checkpoint from the current token balance.
+        client.delegate(&user1, &user1);
         assert_eq!(client.get_votes(&user1), 1500);
         assert_eq!(client.get_past_votes(&user1, &10), 1500);
 
@@ -1531,7 +1625,8 @@ mod tests {
         env.ledger().with_mut(|l| {
             l.sequence_number = 20;
         });
-        client.checkpoint(&user1, &1300i128);
+        token::TokenClient::new(&env, &token_addr).transfer(&user1, &admin, &200i128);
+        client.delegate(&user1, &user1);
         assert_eq!(client.get_votes(&user1), 1300);
         assert_eq!(client.get_past_votes(&user1, &20), 1300);
 
